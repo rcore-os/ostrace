@@ -8,3 +8,8 @@ default = []
 std = []
 
 [dependencies]
+
+[[bin]]
+name = "trace2bytrace"
+path = "src/bin/trace2bytrace.rs"
+required-features = ["std"]

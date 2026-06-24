@@ -18,6 +18,52 @@ const MIN_RING_BUFFER_SIZE: usize = RECORD_HEADER_SIZE * 2;
 const EVENT_CONTEXT_SWITCH: u32 = 1;
 const EVENT_TRACE_MARK_BEGIN: u32 = 2;
 const EVENT_TRACE_MARK_END: u32 = 3;
+const TRACE_IMAGE_HEADER_SIZE: usize = 96;
+const TRACE_IMAGE_CPU_DESC_SIZE: usize = 80;
+const TRACE_IMAGE_ENDIAN_LITTLE: u8 = 1;
+const TRACE_IMAGE_FLAG_ACTIVE: u64 = 1;
+const TRACE_IMAGE_CPU_FLAG_WRITER_ACTIVE: u64 = 1;
+const TRACE_IMAGE_MAGIC_OFFSET: usize = 0;
+const TRACE_IMAGE_CONTAINER_MAJOR_OFFSET: usize = 8;
+const TRACE_IMAGE_CONTAINER_MINOR_OFFSET: usize = 10;
+const TRACE_IMAGE_HEADER_SIZE_OFFSET: usize = 12;
+const TRACE_IMAGE_ENDIAN_OFFSET: usize = 14;
+const TRACE_IMAGE_RECORD_MAJOR_OFFSET: usize = 16;
+const TRACE_IMAGE_RECORD_MINOR_OFFSET: usize = 18;
+const TRACE_IMAGE_RECORD_HEADER_SIZE_OFFSET: usize = 20;
+const TRACE_IMAGE_RECORD_ALIGN_OFFSET: usize = 22;
+const TRACE_IMAGE_CPU_COUNT_OFFSET: usize = 24;
+const TRACE_IMAGE_CPU_DESC_OFFSET_OFFSET: usize = 32;
+const TRACE_IMAGE_CPU_DESC_SIZE_OFFSET: usize = 40;
+const TRACE_IMAGE_RING_OFFSET_OFFSET: usize = 48;
+const TRACE_IMAGE_IMAGE_SIZE_OFFSET: usize = 56;
+const TRACE_IMAGE_FLAGS_OFFSET: usize = 64;
+const TRACE_IMAGE_BUFFER_MODE_OFFSET: usize = 72;
+const CPU_DESC_CPU_ID_OFFSET: usize = 0;
+const CPU_DESC_BUFFER_OFFSET_OFFSET: usize = 8;
+const CPU_DESC_BUFFER_SIZE_OFFSET: usize = 16;
+const CPU_DESC_WRITE_POS_OFFSET: usize = 24;
+const CPU_DESC_READ_POS_OFFSET: usize = 32;
+const CPU_DESC_USED_OFFSET: usize = 40;
+const CPU_DESC_NEXT_SEQ_OFFSET: usize = 48;
+const CPU_DESC_DROPPED_OFFSET: usize = 56;
+const CPU_DESC_REENTRANT_DROPPED_OFFSET: usize = 64;
+const CPU_DESC_FLAGS_OFFSET: usize = 72;
+
+/// Magic value used to identify an `ostrace` trace image in a RAM dump.
+pub const TRACE_IMAGE_MAGIC: u64 = 0x0045_4341_5254_534f;
+
+/// Major version of the trace image container layout.
+pub const TRACE_IMAGE_CONTAINER_VERSION_MAJOR: u16 = 1;
+
+/// Minor version of the trace image container layout.
+pub const TRACE_IMAGE_CONTAINER_VERSION_MINOR: u16 = 0;
+
+/// Major version of the binary record payload format.
+pub const TRACE_RECORD_FORMAT_VERSION_MAJOR: u16 = 1;
+
+/// Minor version of the binary record payload format.
+pub const TRACE_RECORD_FORMAT_VERSION_MINOR: u16 = 0;
 
 /// Identifies the binary record kind stored in a trace ring buffer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,6 +185,570 @@ pub trait TracePlatform {
     /// Implementations should avoid side effects because this method is called
     /// on the trace hot path.
     fn cpu_id(&self) -> u32;
+}
+
+/// Errors returned while initializing or parsing a trace image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TraceImageError {
+    /// The supplied image buffer is too small for the requested layout.
+    ImageTooSmall,
+    /// `cpu_count` was zero.
+    InvalidCpuCount,
+    /// The requested per-CPU ring buffer size is too small.
+    BufferTooSmall,
+    /// The image magic value does not match [`TRACE_IMAGE_MAGIC`].
+    BadMagic {
+        /// Magic value found in the image.
+        found: u64,
+    },
+    /// The image endian marker is not supported by this parser.
+    UnsupportedEndian {
+        /// Endian marker found in the image.
+        found: u8,
+    },
+    /// The container version is not supported by this parser.
+    UnsupportedContainerVersion {
+        /// Major version found in the image.
+        found_major: u16,
+        /// Minor version found in the image.
+        found_minor: u16,
+    },
+    /// The record format version is not supported by this parser.
+    UnsupportedRecordVersion {
+        /// Major version found in the image.
+        found_major: u16,
+        /// Minor version found in the image.
+        found_minor: u16,
+    },
+    /// The image header size is smaller than the known v1 header prefix.
+    InvalidHeaderSize,
+    /// The CPU descriptor size is smaller than the known v1 descriptor prefix.
+    InvalidCpuDescriptorSize,
+    /// A descriptor points outside the trace image.
+    BufferOutOfRange,
+    /// A RAM dump address calculation does not fit inside the supplied RAM bytes.
+    RamRangeOutOfBounds,
+    /// The requested trace base is below the RAM base.
+    TraceBaseBeforeRamBase,
+}
+
+/// Configuration used to initialize one self-describing trace image.
+pub struct TraceImageConfig<'a, P> {
+    /// Caller-owned RAM region that will contain the full trace image.
+    pub bytes: &'a mut [u8],
+    /// Number of CPUs that may write records.
+    pub cpu_count: usize,
+    /// Size in bytes of each per-CPU ring buffer inside `bytes`.
+    pub per_cpu_buffer_size: usize,
+    /// Ring buffer overflow policy.
+    pub mode: BufferMode,
+    /// Platform hooks used to obtain timestamps and CPU ids.
+    pub platform: P,
+}
+
+/// Active trace image backed by one caller-provided RAM region.
+///
+/// The image owns no memory. Header fields, CPU descriptors, and per-CPU ring
+/// buffers are all stored inside the supplied byte slice.
+pub struct TraceImage<'a, P> {
+    /// Full trace image bytes.
+    bytes: &'a mut [u8],
+    /// Runtime CPU count enabled for tracing.
+    cpu_count: usize,
+    /// Platform hooks used by append operations.
+    platform: P,
+    /// Ring buffer overflow policy.
+    mode: BufferMode,
+}
+
+impl<'a, P: TracePlatform> TraceImage<'a, P> {
+    /// Initializes a trace image inside one caller-provided RAM region.
+    ///
+    /// # Parameters
+    ///
+    /// - `config`: Image backing bytes, CPU count, per-CPU buffer size, buffer
+    ///   mode, and platform hooks.
+    ///
+    /// # Returns
+    ///
+    /// Returns an active [`TraceImage`] on success.
+    /// Returns [`TraceImageError::InvalidCpuCount`] if `cpu_count == 0`.
+    /// Returns [`TraceImageError::BufferTooSmall`] if the per-CPU buffer size is
+    /// too small for ring records.
+    /// Returns [`TraceImageError::ImageTooSmall`] if `bytes` cannot hold the
+    /// image header, CPU descriptors, and all per-CPU buffers.
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    ///
+    /// # Side Effects
+    ///
+    /// Clears the supplied RAM region, writes the image header and CPU
+    /// descriptors, marks the image active, and reserves per-CPU ring buffers
+    /// inside the same RAM region.
+    pub fn init(config: TraceImageConfig<'a, P>) -> Result<Self, TraceImageError> {
+        if config.cpu_count == 0 {
+            return Err(TraceImageError::InvalidCpuCount);
+        }
+        if config.per_cpu_buffer_size < MIN_RING_BUFFER_SIZE {
+            return Err(TraceImageError::BufferTooSmall);
+        }
+        let desc_offset = TRACE_IMAGE_HEADER_SIZE;
+        let ring_offset = align_up(
+            desc_offset + config.cpu_count * TRACE_IMAGE_CPU_DESC_SIZE,
+            RECORD_ALIGN,
+        );
+        let image_size = ring_offset + config.cpu_count * config.per_cpu_buffer_size;
+        if image_size > config.bytes.len() {
+            return Err(TraceImageError::ImageTooSmall);
+        }
+
+        config.bytes[..image_size].fill(0);
+        write_image_header(
+            config.bytes,
+            config.cpu_count,
+            desc_offset,
+            ring_offset,
+            image_size,
+            config.mode,
+            true,
+        );
+        for cpu in 0..config.cpu_count {
+            let buffer_offset = ring_offset + cpu * config.per_cpu_buffer_size;
+            let desc = CpuImageDescriptor {
+                cpu_id: cpu as u32,
+                buffer_offset,
+                buffer_size: config.per_cpu_buffer_size,
+                state: CpuState::new(),
+            };
+            write_cpu_descriptor(config.bytes, desc_offset, cpu, &desc);
+        }
+
+        Ok(Self {
+            bytes: config.bytes,
+            cpu_count: config.cpu_count,
+            platform: config.platform,
+            mode: config.mode,
+        })
+    }
+
+    /// Appends a CPU context switch record to this image.
+    ///
+    /// # Parameters
+    ///
+    /// - `prev`: Task leaving the CPU.
+    /// - `prev_state`: Off-CPU state entered by `prev`.
+    /// - `next`: Task selected to run on the CPU.
+    ///
+    /// # Returns
+    ///
+    /// Returns [`AppendStatus::Written`] if the record is appended.
+    /// Returns [`AppendStatus::Dropped`] with [`DropReason::InvalidCpu`],
+    /// [`DropReason::Reentrant`], [`DropReason::BufferFull`], or
+    /// [`DropReason::RecordTooLarge`] when the append cannot be completed.
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    ///
+    /// # Side Effects
+    ///
+    /// Reads timestamp and CPU id from the platform, mutates the selected
+    /// in-image ring buffer and descriptor, increments the per-CPU sequence
+    /// number, and may increment drop counters.
+    pub fn context_switch(
+        &mut self,
+        prev: TaskRef<'_>,
+        prev_state: OffCpuState,
+        next: TaskRef<'_>,
+    ) -> AppendStatus {
+        let cpu_id = self.platform.cpu_id();
+        let timestamp = self.platform.now_ns();
+        self.append_for_current_cpu(
+            cpu_id,
+            |cpu_id, seq, out| encode_context_switch(out, cpu_id, seq, prev, prev_state, next),
+            RecordKind::ContextSwitch,
+            EVENT_CONTEXT_SWITCH,
+            timestamp,
+        )
+    }
+
+    /// Appends a synchronous trace mark begin record to this image.
+    ///
+    /// # Parameters
+    ///
+    /// - `task`: Task associated with the trace mark.
+    /// - `name`: Slice name. The name is copied into the binary record.
+    ///
+    /// # Returns
+    ///
+    /// Returns [`AppendStatus::Written`] if the record is appended.
+    /// Returns [`AppendStatus::Dropped`] with the same drop reasons documented
+    /// by [`TraceImage::context_switch`].
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    ///
+    /// # Side Effects
+    ///
+    /// Reads timestamp and CPU id from the platform, mutates the selected
+    /// in-image ring buffer and descriptor, increments the per-CPU sequence
+    /// number, and may increment drop counters.
+    pub fn trace_mark_begin(&mut self, task: TaskRef<'_>, name: &str) -> AppendStatus {
+        let cpu_id = self.platform.cpu_id();
+        let timestamp = self.platform.now_ns();
+        self.append_for_current_cpu(
+            cpu_id,
+            |cpu_id, seq, out| encode_trace_mark_begin(out, cpu_id, seq, task, name),
+            RecordKind::DurationBegin,
+            EVENT_TRACE_MARK_BEGIN,
+            timestamp,
+        )
+    }
+
+    /// Appends a synchronous trace mark end record to this image.
+    ///
+    /// # Parameters
+    ///
+    /// - `task`: Task associated with the ending trace mark.
+    ///
+    /// # Returns
+    ///
+    /// Returns [`AppendStatus::Written`] if the record is appended.
+    /// Returns [`AppendStatus::Dropped`] with the same drop reasons documented
+    /// by [`TraceImage::context_switch`].
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    ///
+    /// # Side Effects
+    ///
+    /// Reads timestamp and CPU id from the platform, mutates the selected
+    /// in-image ring buffer and descriptor, increments the per-CPU sequence
+    /// number, and may increment drop counters.
+    pub fn trace_mark_end(&mut self, task: TaskRef<'_>) -> AppendStatus {
+        let cpu_id = self.platform.cpu_id();
+        let timestamp = self.platform.now_ns();
+        self.append_for_current_cpu(
+            cpu_id,
+            |cpu_id, seq, out| encode_trace_mark_end(out, cpu_id, seq, task),
+            RecordKind::DurationEnd,
+            EVENT_TRACE_MARK_END,
+            timestamp,
+        )
+    }
+
+    /// Marks this image as no longer actively written.
+    ///
+    /// # Returns
+    ///
+    /// This function does not return a value.
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    ///
+    /// # Side Effects
+    ///
+    /// Clears the active flag in the image header. Existing records and
+    /// descriptors remain in place for host-side parsing.
+    pub fn finish(&mut self) {
+        let flags = read_u64_at(self.bytes, TRACE_IMAGE_FLAGS_OFFSET) & !TRACE_IMAGE_FLAG_ACTIVE;
+        write_u64_at(self.bytes, TRACE_IMAGE_FLAGS_OFFSET, flags);
+    }
+
+    /// Creates a read-only snapshot view of this image.
+    ///
+    /// # Returns
+    ///
+    /// Returns a [`TraceImageSnapshot`] borrowing this image's RAM bytes.
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    ///
+    /// # Side Effects
+    ///
+    /// This function has no side effects. It does not copy records or stop the
+    /// image.
+    pub fn snapshot(&self) -> TraceImageSnapshot<'_> {
+        TraceImageSnapshot {
+            bytes: self.bytes,
+            cpu_count: self.cpu_count,
+            desc_offset: TRACE_IMAGE_HEADER_SIZE,
+            desc_size: TRACE_IMAGE_CPU_DESC_SIZE,
+        }
+    }
+
+    fn append_for_current_cpu<F>(
+        &mut self,
+        cpu_id: u32,
+        encode_payload: F,
+        kind: RecordKind,
+        event_id: u32,
+        timestamp: u64,
+    ) -> AppendStatus
+    where
+        F: FnOnce(u32, u64, &mut PayloadWriter<'_>) -> Result<(), DropReason>,
+    {
+        let cpu_index = cpu_id as usize;
+        if cpu_index >= self.cpu_count {
+            return AppendStatus::Dropped(DropReason::InvalidCpu);
+        }
+
+        let desc_offset = read_u64_at(self.bytes, TRACE_IMAGE_CPU_DESC_OFFSET_OFFSET) as usize;
+        let mut desc = match read_cpu_descriptor(self.bytes, desc_offset, cpu_index) {
+            Some(desc) => desc,
+            None => return AppendStatus::Dropped(DropReason::RecordTooLarge),
+        };
+        if desc.state.writer_active {
+            desc.state.dropped = desc.state.dropped.saturating_add(1);
+            desc.state.reentrant_dropped = desc.state.reentrant_dropped.saturating_add(1);
+            write_cpu_descriptor(self.bytes, desc_offset, cpu_index, &desc);
+            return AppendStatus::Dropped(DropReason::Reentrant);
+        }
+
+        desc.state.writer_active = true;
+        write_cpu_descriptor(self.bytes, desc_offset, cpu_index, &desc);
+
+        let seq = desc.state.per_cpu_seq;
+        desc.state.per_cpu_seq = desc.state.per_cpu_seq.saturating_add(1);
+
+        let mut payload = [0u8; 512];
+        let mut writer = PayloadWriter::new(&mut payload);
+        let result = encode_payload(cpu_id, seq, &mut writer).and_then(|()| {
+            let start = desc.buffer_offset;
+            let end = desc.buffer_offset + desc.buffer_size;
+            append_encoded_record(
+                &mut desc.state,
+                &mut self.bytes[start..end],
+                self.mode,
+                kind,
+                event_id,
+                timestamp,
+                writer.written(),
+            )
+        });
+
+        desc.state.writer_active = false;
+        let status = match result {
+            Ok(()) => AppendStatus::Written,
+            Err(reason) => {
+                desc.state.dropped = desc.state.dropped.saturating_add(1);
+                AppendStatus::Dropped(reason)
+            }
+        };
+        write_cpu_descriptor(self.bytes, desc_offset, cpu_index, &desc);
+        status
+    }
+}
+
+impl<P> Drop for TraceImage<'_, P> {
+    fn drop(&mut self) {
+        let flags = read_u64_at(self.bytes, TRACE_IMAGE_FLAGS_OFFSET) & !TRACE_IMAGE_FLAG_ACTIVE;
+        write_u64_at(self.bytes, TRACE_IMAGE_FLAGS_OFFSET, flags);
+    }
+}
+
+/// Read-only snapshot of a self-describing trace image.
+pub struct TraceImageSnapshot<'a> {
+    /// Full trace image bytes.
+    bytes: &'a [u8],
+    /// Number of active CPU descriptors.
+    cpu_count: usize,
+    /// Offset of the CPU descriptor table.
+    desc_offset: usize,
+    /// Size of each CPU descriptor in bytes.
+    desc_size: usize,
+}
+
+impl<'a> TraceImageSnapshot<'a> {
+    /// Parses a trace image from a byte slice.
+    ///
+    /// # Parameters
+    ///
+    /// - `bytes`: Byte slice that starts at a trace image header.
+    ///
+    /// # Returns
+    ///
+    /// Returns a [`TraceImageSnapshot`] if the header and descriptors are
+    /// supported. Returns [`TraceImageError`] when the image is not recognized or
+    /// is not compatible with this parser.
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    ///
+    /// # Side Effects
+    ///
+    /// This function has no side effects.
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, TraceImageError> {
+        validate_image_header(bytes)?;
+        let cpu_count = read_u32_at(bytes, TRACE_IMAGE_CPU_COUNT_OFFSET) as usize;
+        let desc_offset = read_u64_at(bytes, TRACE_IMAGE_CPU_DESC_OFFSET_OFFSET) as usize;
+        let desc_size = read_u16_at(bytes, TRACE_IMAGE_CPU_DESC_SIZE_OFFSET) as usize;
+        let image_size = read_u64_at(bytes, TRACE_IMAGE_IMAGE_SIZE_OFFSET) as usize;
+        if image_size > bytes.len() {
+            return Err(TraceImageError::ImageTooSmall);
+        }
+        for cpu in 0..cpu_count {
+            let desc = read_cpu_descriptor(bytes, desc_offset, cpu)
+                .ok_or(TraceImageError::InvalidCpuDescriptorSize)?;
+            let end = desc
+                .buffer_offset
+                .checked_add(desc.buffer_size)
+                .ok_or(TraceImageError::BufferOutOfRange)?;
+            if end > image_size {
+                return Err(TraceImageError::BufferOutOfRange);
+            }
+        }
+        Ok(Self {
+            bytes: &bytes[..image_size],
+            cpu_count,
+            desc_offset,
+            desc_size,
+        })
+    }
+
+    /// Parses a trace image embedded in a RAM dump.
+    ///
+    /// # Parameters
+    ///
+    /// - `ram`: Full RAM dump bytes.
+    /// - `ram_base`: Physical address represented by `ram[0]`.
+    /// - `trace_base`: Physical address of the trace image.
+    ///
+    /// # Returns
+    ///
+    /// Returns a [`TraceImageSnapshot`] if the address range contains a supported
+    /// image. Returns [`TraceImageError::TraceBaseBeforeRamBase`] if
+    /// `trace_base < ram_base`, or [`TraceImageError::RamRangeOutOfBounds`] if
+    /// the image header or declared image size is outside `ram`.
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    ///
+    /// # Side Effects
+    ///
+    /// This function has no side effects.
+    pub fn parse_from_ram(
+        ram: &'a [u8],
+        ram_base: u64,
+        trace_base: u64,
+    ) -> Result<Self, TraceImageError> {
+        let trace_offset = trace_base
+            .checked_sub(ram_base)
+            .ok_or(TraceImageError::TraceBaseBeforeRamBase)? as usize;
+        if trace_offset + TRACE_IMAGE_HEADER_SIZE > ram.len() {
+            return Err(TraceImageError::RamRangeOutOfBounds);
+        }
+        let bytes = &ram[trace_offset..];
+        validate_image_header(bytes)?;
+        let image_size = read_u64_at(bytes, TRACE_IMAGE_IMAGE_SIZE_OFFSET) as usize;
+        if image_size > bytes.len() {
+            return Err(TraceImageError::RamRangeOutOfBounds);
+        }
+        Self::parse(&bytes[..image_size])
+    }
+
+    /// Returns the number of active CPU streams.
+    ///
+    /// # Returns
+    ///
+    /// Returns the CPU count declared by the image header.
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    ///
+    /// # Side Effects
+    ///
+    /// This function has no side effects.
+    pub fn cpu_count(&self) -> usize {
+        self.cpu_count
+    }
+
+    /// Returns a read-only stream for one CPU.
+    ///
+    /// # Parameters
+    ///
+    /// - `cpu`: Zero-based CPU index.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Some(TraceImageCpuStream)` if `cpu` is within the image CPU
+    /// count; otherwise returns `None`.
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    ///
+    /// # Side Effects
+    ///
+    /// This function has no side effects.
+    pub fn cpu_stream(&self, cpu: usize) -> Option<TraceImageCpuStream<'a>> {
+        if cpu >= self.cpu_count {
+            return None;
+        }
+        let desc = read_cpu_descriptor(self.bytes, self.desc_offset, cpu)?;
+        let bytes = &self.bytes[desc.buffer_offset..desc.buffer_offset + desc.buffer_size];
+        Some(TraceImageCpuStream {
+            state: desc.state,
+            bytes,
+        })
+    }
+
+    /// Returns the size of CPU descriptors in this image.
+    ///
+    /// # Returns
+    ///
+    /// Returns the descriptor size declared by the image header.
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    ///
+    /// # Side Effects
+    ///
+    /// This function has no side effects.
+    pub fn cpu_descriptor_size(&self) -> usize {
+        self.desc_size
+    }
+}
+
+/// Read-only stream for one CPU inside a trace image.
+pub struct TraceImageCpuStream<'a> {
+    /// Per-CPU state copied from the image descriptor.
+    state: CpuState,
+    /// Per-CPU ring buffer bytes.
+    bytes: &'a [u8],
+}
+
+impl<'a> TraceImageCpuStream<'a> {
+    /// Returns an iterator over readable non-padding records.
+    ///
+    /// # Returns
+    ///
+    /// Returns a [`RecordIter`] starting at this CPU's oldest readable record.
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    ///
+    /// # Side Effects
+    ///
+    /// This function has no side effects.
+    pub fn records(&self) -> RecordIter<'a> {
+        RecordIter {
+            bytes: self.bytes,
+            pos: self.state.read_pos,
+            remaining: self.state.used,
+        }
+    }
 }
 
 /// Describes a task referenced by a trace event.
@@ -1111,6 +1721,212 @@ impl<'a> RawRecord<'a> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CpuImageDescriptor {
+    cpu_id: u32,
+    buffer_offset: usize,
+    buffer_size: usize,
+    state: CpuState,
+}
+
+fn write_image_header(
+    bytes: &mut [u8],
+    cpu_count: usize,
+    desc_offset: usize,
+    ring_offset: usize,
+    image_size: usize,
+    mode: BufferMode,
+    active: bool,
+) {
+    write_u64_at(bytes, TRACE_IMAGE_MAGIC_OFFSET, TRACE_IMAGE_MAGIC);
+    write_u16_at(
+        bytes,
+        TRACE_IMAGE_CONTAINER_MAJOR_OFFSET,
+        TRACE_IMAGE_CONTAINER_VERSION_MAJOR,
+    );
+    write_u16_at(
+        bytes,
+        TRACE_IMAGE_CONTAINER_MINOR_OFFSET,
+        TRACE_IMAGE_CONTAINER_VERSION_MINOR,
+    );
+    write_u16_at(
+        bytes,
+        TRACE_IMAGE_HEADER_SIZE_OFFSET,
+        TRACE_IMAGE_HEADER_SIZE as u16,
+    );
+    bytes[TRACE_IMAGE_ENDIAN_OFFSET] = TRACE_IMAGE_ENDIAN_LITTLE;
+    write_u16_at(
+        bytes,
+        TRACE_IMAGE_RECORD_MAJOR_OFFSET,
+        TRACE_RECORD_FORMAT_VERSION_MAJOR,
+    );
+    write_u16_at(
+        bytes,
+        TRACE_IMAGE_RECORD_MINOR_OFFSET,
+        TRACE_RECORD_FORMAT_VERSION_MINOR,
+    );
+    write_u16_at(
+        bytes,
+        TRACE_IMAGE_RECORD_HEADER_SIZE_OFFSET,
+        RECORD_HEADER_SIZE as u16,
+    );
+    write_u16_at(bytes, TRACE_IMAGE_RECORD_ALIGN_OFFSET, RECORD_ALIGN as u16);
+    write_u32_at(bytes, TRACE_IMAGE_CPU_COUNT_OFFSET, cpu_count as u32);
+    write_u64_at(
+        bytes,
+        TRACE_IMAGE_CPU_DESC_OFFSET_OFFSET,
+        desc_offset as u64,
+    );
+    write_u16_at(
+        bytes,
+        TRACE_IMAGE_CPU_DESC_SIZE_OFFSET,
+        TRACE_IMAGE_CPU_DESC_SIZE as u16,
+    );
+    write_u64_at(bytes, TRACE_IMAGE_RING_OFFSET_OFFSET, ring_offset as u64);
+    write_u64_at(bytes, TRACE_IMAGE_IMAGE_SIZE_OFFSET, image_size as u64);
+    write_u64_at(
+        bytes,
+        TRACE_IMAGE_FLAGS_OFFSET,
+        if active { TRACE_IMAGE_FLAG_ACTIVE } else { 0 },
+    );
+    write_u32_at(
+        bytes,
+        TRACE_IMAGE_BUFFER_MODE_OFFSET,
+        match mode {
+            BufferMode::Overwrite => 0,
+            BufferMode::StopOnFull => 1,
+        },
+    );
+}
+
+fn validate_image_header(bytes: &[u8]) -> Result<(), TraceImageError> {
+    if bytes.len() < TRACE_IMAGE_HEADER_SIZE {
+        return Err(TraceImageError::ImageTooSmall);
+    }
+    let magic = read_u64_at(bytes, TRACE_IMAGE_MAGIC_OFFSET);
+    if magic != TRACE_IMAGE_MAGIC {
+        return Err(TraceImageError::BadMagic { found: magic });
+    }
+    let endian = bytes[TRACE_IMAGE_ENDIAN_OFFSET];
+    if endian != TRACE_IMAGE_ENDIAN_LITTLE {
+        return Err(TraceImageError::UnsupportedEndian { found: endian });
+    }
+    let container_major = read_u16_at(bytes, TRACE_IMAGE_CONTAINER_MAJOR_OFFSET);
+    let container_minor = read_u16_at(bytes, TRACE_IMAGE_CONTAINER_MINOR_OFFSET);
+    if container_major != TRACE_IMAGE_CONTAINER_VERSION_MAJOR {
+        return Err(TraceImageError::UnsupportedContainerVersion {
+            found_major: container_major,
+            found_minor: container_minor,
+        });
+    }
+    let header_size = read_u16_at(bytes, TRACE_IMAGE_HEADER_SIZE_OFFSET) as usize;
+    if header_size < TRACE_IMAGE_HEADER_SIZE {
+        return Err(TraceImageError::InvalidHeaderSize);
+    }
+    let record_major = read_u16_at(bytes, TRACE_IMAGE_RECORD_MAJOR_OFFSET);
+    let record_minor = read_u16_at(bytes, TRACE_IMAGE_RECORD_MINOR_OFFSET);
+    if record_major != TRACE_RECORD_FORMAT_VERSION_MAJOR {
+        return Err(TraceImageError::UnsupportedRecordVersion {
+            found_major: record_major,
+            found_minor: record_minor,
+        });
+    }
+    if read_u16_at(bytes, TRACE_IMAGE_RECORD_HEADER_SIZE_OFFSET) as usize != RECORD_HEADER_SIZE {
+        return Err(TraceImageError::UnsupportedRecordVersion {
+            found_major: record_major,
+            found_minor: record_minor,
+        });
+    }
+    if read_u16_at(bytes, TRACE_IMAGE_RECORD_ALIGN_OFFSET) as usize != RECORD_ALIGN {
+        return Err(TraceImageError::UnsupportedRecordVersion {
+            found_major: record_major,
+            found_minor: record_minor,
+        });
+    }
+    let desc_size = read_u16_at(bytes, TRACE_IMAGE_CPU_DESC_SIZE_OFFSET) as usize;
+    if desc_size < TRACE_IMAGE_CPU_DESC_SIZE {
+        return Err(TraceImageError::InvalidCpuDescriptorSize);
+    }
+    Ok(())
+}
+
+fn write_cpu_descriptor(
+    bytes: &mut [u8],
+    desc_offset: usize,
+    cpu: usize,
+    desc: &CpuImageDescriptor,
+) {
+    let offset = desc_offset + cpu * TRACE_IMAGE_CPU_DESC_SIZE;
+    write_u32_at(bytes, offset + CPU_DESC_CPU_ID_OFFSET, desc.cpu_id);
+    write_u64_at(
+        bytes,
+        offset + CPU_DESC_BUFFER_OFFSET_OFFSET,
+        desc.buffer_offset as u64,
+    );
+    write_u64_at(
+        bytes,
+        offset + CPU_DESC_BUFFER_SIZE_OFFSET,
+        desc.buffer_size as u64,
+    );
+    write_u64_at(
+        bytes,
+        offset + CPU_DESC_WRITE_POS_OFFSET,
+        desc.state.write_pos as u64,
+    );
+    write_u64_at(
+        bytes,
+        offset + CPU_DESC_READ_POS_OFFSET,
+        desc.state.read_pos as u64,
+    );
+    write_u64_at(bytes, offset + CPU_DESC_USED_OFFSET, desc.state.used as u64);
+    write_u64_at(
+        bytes,
+        offset + CPU_DESC_NEXT_SEQ_OFFSET,
+        desc.state.per_cpu_seq,
+    );
+    write_u64_at(bytes, offset + CPU_DESC_DROPPED_OFFSET, desc.state.dropped);
+    write_u64_at(
+        bytes,
+        offset + CPU_DESC_REENTRANT_DROPPED_OFFSET,
+        desc.state.reentrant_dropped,
+    );
+    write_u64_at(
+        bytes,
+        offset + CPU_DESC_FLAGS_OFFSET,
+        if desc.state.writer_active {
+            TRACE_IMAGE_CPU_FLAG_WRITER_ACTIVE
+        } else {
+            0
+        },
+    );
+}
+
+fn read_cpu_descriptor(bytes: &[u8], desc_offset: usize, cpu: usize) -> Option<CpuImageDescriptor> {
+    let desc_size = read_u16_at(bytes, TRACE_IMAGE_CPU_DESC_SIZE_OFFSET) as usize;
+    if desc_size < TRACE_IMAGE_CPU_DESC_SIZE {
+        return None;
+    }
+    let offset = desc_offset.checked_add(cpu.checked_mul(desc_size)?)?;
+    if offset.checked_add(TRACE_IMAGE_CPU_DESC_SIZE)? > bytes.len() {
+        return None;
+    }
+    let flags = read_u64_at(bytes, offset + CPU_DESC_FLAGS_OFFSET);
+    Some(CpuImageDescriptor {
+        cpu_id: read_u32_at(bytes, offset + CPU_DESC_CPU_ID_OFFSET),
+        buffer_offset: read_u64_at(bytes, offset + CPU_DESC_BUFFER_OFFSET_OFFSET) as usize,
+        buffer_size: read_u64_at(bytes, offset + CPU_DESC_BUFFER_SIZE_OFFSET) as usize,
+        state: CpuState {
+            write_pos: read_u64_at(bytes, offset + CPU_DESC_WRITE_POS_OFFSET) as usize,
+            read_pos: read_u64_at(bytes, offset + CPU_DESC_READ_POS_OFFSET) as usize,
+            used: read_u64_at(bytes, offset + CPU_DESC_USED_OFFSET) as usize,
+            per_cpu_seq: read_u64_at(bytes, offset + CPU_DESC_NEXT_SEQ_OFFSET),
+            dropped: read_u64_at(bytes, offset + CPU_DESC_DROPPED_OFFSET),
+            reentrant_dropped: read_u64_at(bytes, offset + CPU_DESC_REENTRANT_DROPPED_OFFSET),
+            writer_active: flags & TRACE_IMAGE_CPU_FLAG_WRITER_ACTIVE != 0,
+        },
+    })
+}
+
 fn append_encoded_record(
     state: &mut CpuState,
     buffer: &mut [u8],
@@ -1408,12 +2224,50 @@ fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
 }
 
+fn read_u16_at(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+fn read_u32_at(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
+}
+
+fn read_u64_at(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+        bytes[offset + 4],
+        bytes[offset + 5],
+        bytes[offset + 6],
+        bytes[offset + 7],
+    ])
+}
+
+fn write_u16_at(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32_at(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u64_at(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
 #[cfg(feature = "std")]
 /// Exporters that require the Rust standard library.
 pub mod export {
     /// bytrace text exporter.
     pub mod bytrace {
-        use crate::{DecodedRecord, TraceSnapshot};
+        use crate::{DecodedRecord, TraceImageSnapshot, TraceSnapshot};
         use std::format;
         use std::io::{Result, Write};
         use std::string::String;
@@ -1451,8 +2305,49 @@ pub mod export {
                     }
                 }
             }
-            records.sort_by_key(sort_key);
+            write_records(records, out)
+        }
 
+        /// Writes a trace image snapshot as SmartPerf-compatible bytrace text.
+        ///
+        /// # Parameters
+        ///
+        /// - `snapshot`: Trace image snapshot containing one stream per CPU.
+        /// - `out`: Destination writer that receives bytrace text.
+        ///
+        /// # Returns
+        ///
+        /// Returns `Ok(())` after all supported records are written.
+        /// Returns any [`std::io::Error`] produced by `out`.
+        ///
+        /// # Panics
+        ///
+        /// This function does not panic.
+        ///
+        /// # Side Effects
+        ///
+        /// Writes a bytrace header and event lines to `out`. It allocates a
+        /// temporary host-side vector, decodes supported image records, and
+        /// sorts them by `(timestamp, cpu_id, per_cpu_seq)`.
+        pub fn write_image_bytrace<W: Write>(
+            snapshot: TraceImageSnapshot<'_>,
+            out: &mut W,
+        ) -> Result<()> {
+            let mut records = Vec::new();
+            for cpu in 0..snapshot.cpu_count() {
+                if let Some(stream) = snapshot.cpu_stream(cpu) {
+                    for record in stream.records() {
+                        if let Some(decoded) = record.decode() {
+                            records.push(decoded);
+                        }
+                    }
+                }
+            }
+            write_records(records, out)
+        }
+
+        fn write_records<W: Write>(mut records: Vec<DecodedRecord<'_>>, out: &mut W) -> Result<()> {
+            records.sort_by_key(sort_key);
             writeln!(out, "# tracer: nop")?;
             writeln!(
                 out,
@@ -1563,304 +2458,4 @@ pub mod export {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[cfg(feature = "std")]
-    use std::string::String;
-    use std::vec::Vec;
-
-    #[test]
-    fn record_header_size_is_stable() {
-        assert_eq!(RECORD_HEADER_SIZE, 16);
-    }
-
-    #[test]
-    fn single_cpu_append_order_is_preserved() {
-        let mut storage = TraceStorage::new();
-        let platform = TestPlatform::new(&[0, 0], &[10, 20]);
-        let mut recorder = TraceRecorder::new(TraceConfig {
-            storage: &mut storage,
-            cpu_count: 1,
-            platform,
-        })
-        .unwrap();
-        let mut session_storage = TraceSessionStorage::<1>::new();
-        let mut buf0 = [0u8; 512];
-        let mut cpu_buffers = [CpuBuffer { bytes: &mut buf0 }];
-        let mut session = recorder
-            .start_session(SessionConfig {
-                state: &mut session_storage,
-                cpu_buffers: &mut cpu_buffers,
-                mode: BufferMode::Overwrite,
-            })
-            .unwrap();
-        assert_eq!(
-            session.trace_mark_begin(task("A", 1, 1), "outer"),
-            AppendStatus::Written
-        );
-        assert_eq!(
-            session.trace_mark_end(task("A", 1, 1)),
-            AppendStatus::Written
-        );
-
-        let records = decoded(session.snapshot());
-        assert!(matches!(
-            records[0],
-            DecodedRecord::TraceMarkBegin { name: "outer", .. }
-        ));
-        assert!(matches!(records[1], DecodedRecord::TraceMarkEnd { .. }));
-    }
-
-    #[test]
-    fn multi_cpu_append_is_independent() {
-        let mut storage = TraceStorage::new();
-        let platform = TestPlatform::new(&[0, 1], &[10, 20]);
-        let mut recorder = TraceRecorder::new(TraceConfig {
-            storage: &mut storage,
-            cpu_count: 2,
-            platform,
-        })
-        .unwrap();
-        let mut session_storage = TraceSessionStorage::<2>::new();
-        let mut buf0 = [0u8; 512];
-        let mut buf1 = [0u8; 512];
-        let mut cpu_buffers = [
-            CpuBuffer { bytes: &mut buf0 },
-            CpuBuffer { bytes: &mut buf1 },
-        ];
-        let mut session = recorder
-            .start_session(SessionConfig {
-                state: &mut session_storage,
-                cpu_buffers: &mut cpu_buffers,
-                mode: BufferMode::Overwrite,
-            })
-            .unwrap();
-        assert_eq!(
-            session.trace_mark_begin(task("A", 1, 1), "cpu0"),
-            AppendStatus::Written
-        );
-        assert_eq!(
-            session.trace_mark_begin(task("B", 2, 2), "cpu1"),
-            AppendStatus::Written
-        );
-
-        let snapshot = session.snapshot();
-        let cpu0: Vec<_> = snapshot.cpu_stream(0).unwrap().records().collect();
-        let cpu1: Vec<_> = snapshot.cpu_stream(1).unwrap().records().collect();
-        assert_eq!(cpu0.len(), 1);
-        assert_eq!(cpu1.len(), 1);
-    }
-
-    #[test]
-    fn overwrite_wrap_drops_old_records() {
-        let mut storage = TraceStorage::new();
-        let platform = TestPlatform::new(&[0, 0, 0, 0, 0], &[10, 20, 30, 40, 50]);
-        let mut recorder = TraceRecorder::new(TraceConfig {
-            storage: &mut storage,
-            cpu_count: 1,
-            platform,
-        })
-        .unwrap();
-        let mut session_storage = TraceSessionStorage::<1>::new();
-        let mut buf0 = [0u8; 96];
-        let mut cpu_buffers = [CpuBuffer { bytes: &mut buf0 }];
-        let mut session = recorder
-            .start_session(SessionConfig {
-                state: &mut session_storage,
-                cpu_buffers: &mut cpu_buffers,
-                mode: BufferMode::Overwrite,
-            })
-            .unwrap();
-        assert_eq!(
-            session.trace_mark_begin(task("A", 1, 1), "first"),
-            AppendStatus::Written
-        );
-        assert_eq!(
-            session.trace_mark_begin(task("A", 1, 1), "second"),
-            AppendStatus::Written
-        );
-        assert_eq!(
-            session.trace_mark_begin(task("A", 1, 1), "third"),
-            AppendStatus::Written
-        );
-
-        let records = decoded(session.snapshot());
-        assert!(records.len() < 3);
-        assert!(session.state.cpu_state(0).unwrap().dropped() > 0);
-    }
-
-    #[test]
-    fn reentrant_append_is_dropped() {
-        let mut storage = TraceStorage::new();
-        storage.global.active_session = true;
-        let platform = TestPlatform::new(&[0], &[10]);
-        let mut session_storage = TraceSessionStorage::<1>::new();
-        session_storage.cpus[0].set_writer_active_for_test(true);
-        let mut buf0 = [0u8; 512];
-        let mut cpu_buffers = [CpuBuffer { bytes: &mut buf0 }];
-        let mut session = TraceSession {
-            storage: &mut storage,
-            cpu_count: 1,
-            platform: &platform,
-            state: &mut session_storage,
-            cpu_buffers: &mut cpu_buffers,
-            mode: BufferMode::Overwrite,
-        };
-        assert_eq!(
-            session.trace_mark_begin(task("A", 1, 1), "dropped"),
-            AppendStatus::Dropped(DropReason::Reentrant)
-        );
-        assert_eq!(session.state.cpu_state(0).unwrap().reentrant_dropped(), 1);
-    }
-
-    #[test]
-    fn invalid_cpu_is_dropped() {
-        let mut storage = TraceStorage::new();
-        let platform = TestPlatform::new(&[7], &[10]);
-        let mut recorder = TraceRecorder::new(TraceConfig {
-            storage: &mut storage,
-            cpu_count: 1,
-            platform,
-        })
-        .unwrap();
-        let mut session_storage = TraceSessionStorage::<1>::new();
-        let mut buf0 = [0u8; 512];
-        let mut cpu_buffers = [CpuBuffer { bytes: &mut buf0 }];
-        let mut session = recorder
-            .start_session(SessionConfig {
-                state: &mut session_storage,
-                cpu_buffers: &mut cpu_buffers,
-                mode: BufferMode::Overwrite,
-            })
-            .unwrap();
-        assert_eq!(
-            session.trace_mark_begin(task("A", 1, 1), "invalid"),
-            AppendStatus::Dropped(DropReason::InvalidCpu)
-        );
-    }
-
-    #[test]
-    fn active_session_rejects_second_session() {
-        let mut storage = TraceStorage::new();
-        storage.global.active_session = true;
-        let platform = TestPlatform::new(&[0], &[10]);
-        let mut recorder = TraceRecorder::new(TraceConfig {
-            storage: &mut storage,
-            cpu_count: 1,
-            platform,
-        })
-        .unwrap();
-        let mut session_storage_a = TraceSessionStorage::<1>::new();
-        let mut buf_a = [0u8; 256];
-        let mut cpu_buffers_a = [CpuBuffer { bytes: &mut buf_a }];
-
-        let result = recorder.start_session(SessionConfig {
-            state: &mut session_storage_a,
-            cpu_buffers: &mut cpu_buffers_a,
-            mode: BufferMode::Overwrite,
-        });
-        assert!(matches!(result, Err(TraceError::SessionAlreadyActive)));
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn bytrace_export_merges_by_timestamp() {
-        let mut storage = TraceStorage::new();
-        let platform = TestPlatform::new(&[1, 0, 1], &[30, 10, 20]);
-        let mut recorder = TraceRecorder::new(TraceConfig {
-            storage: &mut storage,
-            cpu_count: 2,
-            platform,
-        })
-        .unwrap();
-        let mut session_storage = TraceSessionStorage::<2>::new();
-        let mut buf0 = [0u8; 512];
-        let mut buf1 = [0u8; 512];
-        let mut cpu_buffers = [
-            CpuBuffer { bytes: &mut buf0 },
-            CpuBuffer { bytes: &mut buf1 },
-        ];
-        let mut session = recorder
-            .start_session(SessionConfig {
-                state: &mut session_storage,
-                cpu_buffers: &mut cpu_buffers,
-                mode: BufferMode::Overwrite,
-            })
-            .unwrap();
-        assert_eq!(
-            session.trace_mark_begin(task("B", 2, 2), "late"),
-            AppendStatus::Written
-        );
-        assert_eq!(
-            session.context_switch(task("idle", 0, 0), OffCpuState::Running, task("A", 1, 1)),
-            AppendStatus::Written
-        );
-        assert_eq!(
-            session.trace_mark_end(task("B", 2, 2)),
-            AppendStatus::Written
-        );
-
-        let mut out = Vec::new();
-        crate::export::bytrace::write_bytrace(session.snapshot(), &mut out).unwrap();
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("# entries-in-buffer/entries-written: 3/3"));
-        assert!(text.contains("sched_switch: prev_comm=idle prev_pid=0"));
-        assert!(text.contains("tracing_mark_write: B|2|late"));
-        assert!(text.contains("tracing_mark_write: E|2"));
-
-        let switch = text.find("sched_switch").unwrap();
-        let end = text.find("tracing_mark_write: E|2").unwrap();
-        let begin = text.find("tracing_mark_write: B|2|late").unwrap();
-        assert!(switch < end);
-        assert!(end < begin);
-    }
-
-    fn decoded<'a>(snapshot: TraceSnapshot<'a>) -> Vec<DecodedRecord<'a>> {
-        let mut out = Vec::new();
-        for cpu in 0..snapshot.cpu_count() {
-            for record in snapshot.cpu_stream(cpu).unwrap().records() {
-                out.push(record.decode().unwrap());
-            }
-        }
-        out
-    }
-
-    fn task(comm: &str, tid: u32, tgid: u32) -> TaskRef<'_> {
-        TaskRef {
-            comm,
-            tid,
-            tgid,
-            prio: 120,
-        }
-    }
-
-    struct TestPlatform {
-        cpus: Vec<u32>,
-        times: Vec<u64>,
-        index: core::cell::Cell<usize>,
-    }
-
-    impl TestPlatform {
-        fn new(cpus: &[u32], times: &[u64]) -> Self {
-            Self {
-                cpus: cpus.to_vec(),
-                times: times.to_vec(),
-                index: core::cell::Cell::new(0),
-            }
-        }
-    }
-
-    impl TracePlatform for TestPlatform {
-        fn now_ns(&self) -> u64 {
-            let index = self.index.get().min(self.times.len() - 1);
-            let time = self.times[index];
-            self.index.set(self.index.get() + 1);
-            time
-        }
-
-        fn cpu_id(&self) -> u32 {
-            let index = self.index.get().min(self.cpus.len() - 1);
-            self.cpus[index]
-        }
-    }
-}
+mod tests;

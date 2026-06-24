@@ -1,27 +1,67 @@
 # ostrace Design Notes
 
-`ostrace` is a general-purpose `no_std` trace record core for Rust-based OS
-kernels. It is intended to play a role similar to the record-writing core below
-Linux ftrace, while staying independent from any specific OS tracepoint
-framework, file system, allocator, serial driver, QEMU integration, or eBPF
-runtime.
+`ostrace` is a `no_std` trace record core for Rust-based OS kernels. It is
+intended to provide the record-writing layer below an OS-specific tracing
+framework, in a role similar to the lower part of Linux ftrace, while staying
+independent from any specific tracepoint framework, allocator, file system,
+serial driver, QEMU workflow, or eBPF runtime.
 
-The core responsibility is intentionally narrow:
-
-```text
-structured event -> compact binary record -> caller-provided ring buffer
-```
-
-The embedding OS injects:
+The current implementation focuses on a small, runnable tracing path:
 
 ```text
-timestamp, CPU ID, process/thread identity, synchronization, memory buffer,
-and export sinks
+sched/task event -> compact binary record -> per-CPU ring buffer
 ```
 
-Tracepoint frameworks may depend on `ostrace`, but `ostrace` does not depend on
-tracepoints. Normal kernel code can directly emit instant events, duration
-begin/end events, counters, spans, and metadata.
+For OS integration, the preferred storage model is a single caller-owned trace
+image RAM region:
+
+```text
+TraceImageHeader
+CpuDescriptor[cpu_count]
+PerCpuRingBuffer[cpu_count]
+```
+
+The image is a live in-memory container. `ostrace` initializes it, appends
+records into it, updates cursor/drop state in place, and can later parse it from
+a RAM dump. The library does not allocate memory on the kernel path.
+
+## Documentation Sync
+
+`DESIGN.md` and `DESIGN_CN.md` describe the same design in English and Chinese.
+Whenever project design, public API, trace image layout, record format, exporter
+behavior, or development policy changes, both files must be updated in the same
+change. If one file intentionally differs, the reason must be documented in both
+files.
+
+## Current Scope
+
+Implemented now:
+
+- `#![no_std]` library core.
+- Strict public API rustdoc lints.
+- Caller-provided memory only; no library-owned heap allocation on the trace
+  hot path.
+- Preferred single-RAM-region trace image API.
+- Older split-storage session API for tests and experiments.
+- Per-CPU ring buffers.
+- Per-CPU append order with `per_cpu_seq`.
+- Reentrant append detection per CPU.
+- `Overwrite` and `StopOnFull` buffer modes.
+- `sched_switch`-style context switch records.
+- Synchronous `tracing_mark_write` begin/end records.
+- Snapshot parsing for a live image or a full RAM dump.
+- `std`-gated bytrace exporter.
+- `trace2bytrace` host tool.
+
+Not implemented yet:
+
+- Generic `instant`, `counter`, async span, or structured metadata events.
+- Task lifecycle metadata such as `task_new`/`task_exit`.
+- Trace mark custom metadata or `custom_args` emission.
+- Global cross-CPU ring buffer.
+- Lock-free multi-writer synchronization.
+- Perfetto protobuf or Chrome Trace JSON export.
+- eBPF verifier, VM, or JIT.
 
 ## Goals
 
@@ -29,10 +69,10 @@ begin/end events, counters, spans, and metadata.
 - Work in teaching OSes, experimental OSes, and production-oriented Rust
   kernels.
 - Work before an allocator or file system exists.
-- Treat caller-provided memory as a fixed ring buffer.
+- Use caller-provided memory as fixed trace storage.
 - Keep the hot path cheap by appending compact binary records only.
-- Support later conversion to ftrace text, Chrome Trace JSON, Perfetto, and
-  related formats.
+- Support host-side conversion to SmartPerf/bytrace now, and later to ftrace
+  text, Chrome Trace JSON, Perfetto, and related formats.
 - Avoid mandatory dependencies on file systems, block devices, serial ports,
   QEMU, eBPF, or a specific tracepoint mechanism.
 
@@ -41,96 +81,189 @@ begin/end events, counters, spans, and metadata.
 - Do not implement an eBPF verifier.
 - Do not implement an eBPF bytecode VM or JIT.
 - Do not execute user programs at hook points.
-- Do not bind directly to the Linux ftrace ABI.
+- Do not bind the core record format directly to the Linux ftrace ABI.
 - Do not generate text formats in the kernel hot path.
 - Do not require the OS to have a file system or allocator.
 
-## Suggested Module Layout
+## Source Layout
+
+The current MVP keeps the core implementation in one library file:
 
 ```text
 src/
   lib.rs
+  bin/
+    trace2bytrace.rs
+```
+
+As the project grows, the implementation should be split along these boundaries:
+
+```text
+src/
+  lib.rs
+  image.rs        // trace image container layout and parser
   record.rs       // record header, kind, payload encoding
   ringbuf.rs      // fixed memory ring buffer
-  writer.rs       // append API
+  session.rs      // split-storage session API
   platform.rs     // OS-injected traits
-  event.rs        // event id, category/name model
-  field.rs        // compact field representation
-  snapshot.rs     // snapshot/drain view
-  filter.rs       // optional enable/disable fast path
-  export/         // optional, likely feature-gated later
-    binary.rs
+  task.rs         // task references and scheduler states
+  snapshot.rs     // snapshot/drain views
+  export/
+    bytrace.rs
     ftrace_text.rs
     chrome_json.rs
     perfetto.rs
 ```
 
-## Core Configuration
+## Core Storage Model
 
-The OS initializes `ostrace` with memory it owns:
+The preferred runtime integration is the trace image API. The OS supplies one
+mutable byte slice and `ostrace` formats the image inside it:
+
+```rust
+pub struct TraceImageConfig<'a, P> {
+    pub bytes: &'a mut [u8],
+    pub cpu_count: usize,
+    pub per_cpu_buffer_size: usize,
+    pub mode: BufferMode,
+    pub platform: P,
+}
+```
+
+`bytes` is the only persistent storage required by this path. Small stack
+buffers are used while encoding a record, but callers do not provide separate
+global state, session state, or per-CPU buffer arrays for trace image operation.
+
+The older split-storage API remains available:
 
 ```rust
 pub struct TraceConfig<'a, P> {
-    pub buffer: &'a mut [u8],
+    pub storage: &'a mut TraceStorage,
+    pub cpu_count: usize,
     pub platform: P,
-    pub mode: BufferMode,
 }
 
-pub enum BufferMode {
-    Overwrite,
-    StopOnFull,
+pub struct SessionConfig<'a, const MAX_CPUS: usize> {
+    pub state: &'a mut TraceSessionStorage<MAX_CPUS>,
+    pub cpu_buffers: &'a mut [CpuBuffer<'a>],
+    pub mode: BufferMode,
 }
 ```
 
-The OS provides platform-specific data through a trait:
+This API is useful for focused tests and experiments. New OS integrations should
+prefer `TraceImage`, because a host tool can parse it directly from RAM without
+reconstructing hidden Rust state.
+
+## Trace Image Layout
+
+All integer fields are little-endian in the current format.
+
+Header constants:
+
+```text
+TRACE_IMAGE_MAGIC = 0x0045_4341_5254_534f
+container version = 1.0
+record format version = 1.0
+header size = 96 bytes
+CPU descriptor size = 80 bytes
+record header size = 16 bytes
+record alignment = 8 bytes
+```
+
+The header v1 prefix currently stores:
+
+```text
+offset  size  field
+0       8     magic
+8       2     container_major
+10      2     container_minor
+12      2     header_size
+14      1     endian marker, 1 means little-endian
+16      2     record_major
+18      2     record_minor
+20      2     record_header_size
+22      2     record_align
+24      4     cpu_count
+32      8     cpu_descriptor_offset
+40      2     cpu_descriptor_size
+48      8     ring_buffer_region_offset
+56      8     image_size
+64      8     flags, bit 0 means active
+72      4     buffer_mode, 0 means Overwrite and 1 means StopOnFull
+```
+
+Each CPU descriptor v1 prefix currently stores:
+
+```text
+offset  size  field
+0       4     cpu_id
+8       8     buffer_offset
+16      8     buffer_size
+24      8     write_pos
+32      8     read_pos
+40      8     used
+48      8     next_per_cpu_seq
+56      8     dropped
+64      8     reentrant_dropped
+72      8     flags, bit 0 means writer_active
+```
+
+The image is not a finish-time artifact. Appending a record mutates the selected
+per-CPU ring buffer and writes the updated CPU descriptor back into the same RAM
+region. A RAM dump taken before clean shutdown can still export committed
+records.
+
+`TraceImage::finish()` and `Drop` clear the image active flag. Existing records
+and descriptors remain parseable.
+
+## Compatibility Rules
+
+Parsers validate the image before export:
+
+- Bad magic means the memory is not an `ostrace` image.
+- Unsupported endian is rejected.
+- Container major version mismatch is rejected.
+- Record major version mismatch is rejected.
+- Unexpected record header size or alignment is rejected.
+- Header and CPU descriptor sizes smaller than the v1 prefix are rejected.
+- Larger header or descriptor sizes are allowed when the known v1 prefix is
+  present, so newer versions can append fields.
+- CPU descriptors that point outside the declared image are rejected.
+- Unknown or malformed record payloads are skipped by current exporters.
+
+The container version and record format version are intentionally separate. A
+container layout change does not necessarily imply that existing record payloads
+changed, and vice versa.
+
+## Platform Hooks
+
+The OS injects the timestamp and CPU id through `TracePlatform`:
 
 ```rust
 pub trait TracePlatform {
-    fn now(&self) -> u64;
+    fn now_ns(&self) -> u64;
     fn cpu_id(&self) -> u32;
-
-    fn current_process_trace_id(&self) -> u64;
-    fn current_thread_trace_id(&self) -> u64;
-
-    fn current_raw_pid(&self) -> u64;
-    fn current_raw_tid(&self) -> u64;
 }
 ```
 
-Synchronization should also be injected by the OS rather than assumed by
-`ostrace`:
+`now_ns()` returns the timestamp written into record headers. `cpu_id()` selects
+the per-CPU ring buffer. If the CPU id is outside the configured CPU count, the
+append returns `AppendStatus::Dropped(DropReason::InvalidCpu)`.
 
-```rust
-pub trait TraceGuard {
-    type Guard;
-
-    fn enter(&self) -> Self::Guard;
-}
-```
-
-A single-core teaching OS can implement this by disabling interrupts. An SMP OS
-can use preemption disabling, per-CPU buffer guards, or a kernel lock. Tests can
-use a normal lock.
+The current code does not define a synchronization trait. Same-CPU reentrancy is
+detected by `writer_active`; a reentrant append is dropped and counted instead
+of corrupting the in-progress record. OS integrations are still responsible for
+choosing the right outer synchronization policy, such as disabling preemption,
+using per-CPU guards, or preventing migration around append calls.
 
 ## Record Format
 
-The internal stream is binary, not text. The first version should use a fixed
-header and variable payload:
+Each binary record starts with a 16-byte header:
 
 ```rust
-#[repr(u8)]
-pub enum RecordKind {
-    Instant = 1,
-    DurationBegin = 2,
-    DurationEnd = 3,
-    Counter = 4,
-    Metadata = 5,
-    Padding = 255,
-}
-
 #[repr(C)]
 pub struct RecordHeader {
-    pub len: u16,        // total aligned record length
+    pub len: u16,
     pub kind: RecordKind,
     pub flags: u8,
     pub event_id: u32,
@@ -138,53 +271,160 @@ pub struct RecordHeader {
 }
 ```
 
-Each record is laid out as:
+Header fields are encoded as:
 
 ```text
-[RecordHeader][payload][padding]
+offset  size  field
+0       2     total aligned record length
+2       1     record kind
+3       1     flags, currently zero
+4       4     event_id
+8       8     timestamp in nanoseconds
 ```
 
-Records should be aligned to 8 bytes. If the remaining space at the end of the
-ring buffer cannot fit a complete record, the writer emits a `Padding` record
-and wraps to the beginning. There is no heap fragmentation because the stream is
-append-only and does not allocate or free arbitrary regions.
-
-## Append-Only Semantics
-
-The record stream is append-only:
+Records are aligned to 8 bytes:
 
 ```text
-append event record
-append metadata record
-append padding record
-overwrite old records when ring wraps
+[RecordHeader][payload][zero padding]
 ```
 
-Ring buffer control state is mutable:
+If the remaining bytes at the end of a per-CPU buffer cannot fit the next
+record, the writer emits a `Padding` record when possible, wraps to offset zero,
+and writes the event record there.
+
+Current record kinds and event IDs:
+
+```text
+RecordKind::ContextSwitch = 6, event_id = 1
+RecordKind::DurationBegin = 2, event_id = 2
+RecordKind::DurationEnd   = 3, event_id = 3
+RecordKind::Padding       = 255
+```
+
+Payloads currently use this encoding:
+
+```text
+u16 string length + UTF-8 bytes
+
+TaskRef:
+  u32 tid
+  u32 tgid
+  i32 prio
+  string comm
+
+ContextSwitch:
+  u32 cpu_id
+  u64 per_cpu_seq
+  TaskRef prev
+  u32 prev_state
+  TaskRef next
+
+TraceMarkBegin:
+  u32 cpu_id
+  u64 per_cpu_seq
+  TaskRef task
+  string name
+
+TraceMarkEnd:
+  u32 cpu_id
+  u64 per_cpu_seq
+  TaskRef task
+```
+
+For a context switch, the total record size is:
+
+```text
+align8(16 + 42 + prev.comm.len + next.comm.len)
+```
+
+The 42-byte payload base is `cpu_id + seq + prev task fixed fields +
+prev_comm_len + prev_state + next task fixed fields + next_comm_len`.
+
+## Append Semantics
+
+Each CPU has an independent ring buffer and cursor state:
 
 ```text
 write_pos
-oldest_pos/read_pos
-dropped_count
-flags
+read_pos
+used
+next_per_cpu_seq
+dropped
+reentrant_dropped
+writer_active
 ```
 
-The accurate model is:
+Append behavior:
 
-```text
-record stream append-only
-ring buffer control state mutable
-derived metadata cache optional
+- The writer asks `platform.cpu_id()` for the target CPU.
+- CPU ids outside `cpu_count` return `Dropped(InvalidCpu)`.
+- Same-CPU reentrant appends return `Dropped(Reentrant)` and update drop
+  counters.
+- Payload encoding uses a fixed 512-byte stack scratch buffer; larger payloads
+  return `Dropped(RecordTooLarge)`.
+- In `StopOnFull` mode, insufficient space returns `Dropped(BufferFull)`.
+- In `Overwrite` mode, the writer drops oldest records from that CPU until the
+  new record fits.
+- Per-CPU sequence numbers are assigned before payload encoding and used for
+  stable export ordering.
+
+The write layer guarantees per-CPU order only. Cross-CPU ordering is performed
+when snapshot/export code decodes all CPU streams and sorts records.
+
+## Event API
+
+The current public write API is intentionally narrow:
+
+```rust
+pub fn context_switch(
+    &mut self,
+    prev: TaskRef<'_>,
+    prev_state: OffCpuState,
+    next: TaskRef<'_>,
+) -> AppendStatus;
+
+pub fn trace_mark_begin(&mut self, task: TaskRef<'_>, name: &str) -> AppendStatus;
+
+pub fn trace_mark_end(&mut self, task: TaskRef<'_>) -> AppendStatus;
 ```
 
-The first version should avoid maintaining a strongly consistent index of the
-PIDs or TIDs currently present in the window. Metadata changes should be written
-as ordinary metadata records.
+`TaskRef` uses neutral scheduler terminology:
 
-## PID/TID Reuse
+```rust
+pub struct TaskRef<'a> {
+    pub comm: &'a str,
+    pub tid: u32,
+    pub tgid: u32,
+    pub prio: i32,
+}
+```
 
-The API must not assume that OS-visible PID/TID values are globally unique.
-Separate raw IDs from lifecycle-unique trace IDs:
+The API takes explicit task IDs rather than asking the platform for
+`current_pid`, because scheduler events can involve more than the current task.
+For example, a running task may wake another task from a different process.
+
+`OffCpuState` describes the state entered by the previous task. Exporters map it
+to target-specific spellings such as ftrace/bytrace `R`, `S`, `D`, `T`, and so
+on. The next task is implicitly the one selected to run by the context switch.
+
+Future generic event APIs should be layered on top of the same binary record
+core instead of replacing it:
+
+```rust
+trace::instant!("sched", "wakeup", tid = next_tid);
+trace::begin!("syscall", "read", fd = fd);
+trace::end!("syscall", "read");
+trace::counter!("mm", "free_pages", value = free_pages);
+```
+
+## PID/TID Identity
+
+The current MVP records OS-visible `tid` and `tgid` directly in each `TaskRef`.
+This is sufficient for early bytrace conversion and SmartPerf inspection.
+
+Longer term, the API should not assume that OS-visible PID/TID values are
+globally unique. A later metadata layer should separate raw IDs from
+lifecycle-unique trace IDs:
 
 ```text
 raw_pid/raw_tid:
@@ -194,159 +434,91 @@ trace_pid/trace_tid:
   lifecycle-unique IDs used to bind UI tracks
 ```
 
-The recommended OS integration is to assign monotonically increasing
-`trace_pid` and `trace_tid` values when a process or thread is created and store
-them in the PCB/TCB.
+The recommended OS integration for that future layer is to assign monotonically
+increasing `trace_pid` and `trace_tid` values when a process or thread is
+created and store them in the PCB/TCB. Metadata records would map trace IDs back
+to raw IDs and display names.
 
-Records should use trace IDs. Metadata records map trace IDs back to raw IDs and
-display names:
+## Snapshot And Export
 
-```text
-task_new(trace_pid=1001, trace_tid=2001, raw_pid=3, raw_tid=3, name="shell")
-task_exit(trace_pid=1001, trace_tid=2001)
-```
-
-This prevents tools such as Perfetto or Chrome Trace from merging unrelated
-process or thread lifetimes when a teaching OS later reuses raw PID values.
-
-## Event API
-
-Events do not need to originate from tracepoints. Kernel code should be able to
-emit events directly:
+The hot path writes binary records only. Export happens through read-only
+snapshots:
 
 ```rust
-trace::instant!("sched", "wakeup", tid = next_tid);
-trace::begin!("syscall", "read", fd = fd);
-trace::end!("syscall", "read");
-trace::counter!("mm", "free_pages", value = free_pages);
-
-let _span = trace::span!("fs", "open", path_hash = hash);
+TraceImage::snapshot() -> TraceImageSnapshot<'_>
+TraceImageSnapshot::parse(bytes) -> Result<TraceImageSnapshot<'_>, TraceImageError>
+TraceImageSnapshot::parse_from_ram(ram, ram_base, trace_base)
+TraceSession::snapshot() -> TraceSnapshot<'_>
 ```
 
-The lower-level API can start with ID-based functions:
+`TraceImageSnapshot::parse_from_ram` is intended for host tools that receive a
+full RAM dump. `ram_base` is the physical address represented by `ram[0]`, and
+`trace_base` is the physical address where the trace image starts.
+
+Under the `std` feature, the bytrace exporter writes SmartPerf-compatible text:
 
 ```rust
-pub fn instant(event_id: EventId, fields: &[Field]);
-pub fn begin(event_id: EventId, fields: &[Field]);
-pub fn end(event_id: EventId, fields: &[Field]);
-pub fn counter(event_id: EventId, value: u64, fields: &[Field]);
-pub fn metadata(kind: MetadataKind, fields: &[Field]);
+export::bytrace::write_image_bytrace(snapshot, writer)
+export::bytrace::write_bytrace(snapshot, writer)
 ```
 
-For a teaching-oriented version, string category/name pairs are acceptable. A
-production-oriented version should use statically registered `EventId` values to
-reduce hot-path work.
+The exporter:
 
-## Tracepoint Integration
+- decodes supported records from every CPU stream;
+- ignores malformed or unsupported records;
+- sorts by `(timestamp, cpu_id, per_cpu_seq)`;
+- emits a bytrace text header;
+- maps context switches to `sched_switch`;
+- maps trace mark begin/end to `tracing_mark_write: B|tgid|name` and
+  `tracing_mark_write: E|tgid`.
 
-A tracepoint system should be an external framework that depends on `ostrace`:
+The `trace2bytrace` binary is available with the `std` feature:
+
+```text
+cargo run --features std --bin trace2bytrace -- \
+  --ram path/to/ram.bin \
+  --ram-base 0x80000000 \
+  --trace-base 0x87b00000 \
+  --out path/to/trace.bytrace
+```
+
+## bytrace And SmartPerf Notes
+
+Current output targets the subset needed for early SmartPerf inspection:
+
+```text
+sched_switch: prev_comm=... prev_pid=... prev_prio=... prev_state=... ==> next_comm=... next_pid=... next_prio=...
+tracing_mark_write: B|tgid|name
+tracing_mark_write: E|tgid
+```
+
+SmartPerf can display `tracing_mark_write` duration blocks. Additional
+click-time metadata should eventually be encoded on the `B` line, because the
+`E` line only closes the synchronous slice. A future API may add trace mark
+metadata and export names such as:
+
+```text
+B|tgid|name|Ktag|key=value,key2=value2
+```
+
+That extension is not implemented yet.
+
+## Development Policy
+
+All public Rust APIs must have rustdoc. The crate enforces:
 
 ```rust
-pub trait Tracepoint {
-    const EVENT: EventId;
-    type Context;
-
-    fn fields(ctx: &Self::Context, out: &mut FieldWriter);
-}
+#![deny(missing_docs)]
+#![deny(rustdoc::broken_intra_doc_links)]
+#![deny(rustdoc::bare_urls)]
 ```
 
-At a hook site:
-
-```rust
-let ctx = SchedSwitchCtx { prev, next, prev_state };
-ostrace::record_tracepoint::<SchedSwitch>(&ctx);
-```
-
-The `ostrace` core only needs to know the event ID, record kind, and fields. It
-does not need to know whether the event came from a tracepoint or a direct
-kernel call.
-
-## Snapshot, Drain, and Export
-
-The hot path writes binary records only. Export happens through snapshot or
-drain operations:
-
-```rust
-pub trait TraceSink {
-    fn write(&mut self, bytes: &[u8]) -> Result<(), TraceError>;
-    fn flush(&mut self) -> Result<(), TraceError>;
-}
-
-pub fn drain_to<S: TraceSink>(&self, sink: &mut S) -> Result<(), TraceError>;
-pub fn snapshot(&self) -> TraceSnapshot;
-```
-
-Possible OS-provided sinks:
-
-```text
-SerialSink
-RawBlockSink
-FsFileSink
-VirtioConsoleSink
-NetworkSink
-HostMemoryDumpSink
-```
-
-Before a file system exists, practical capture options include:
-
-```text
-fixed memory ring buffer
-+ QEMU file-backed RAM or monitor pmemsave
-+ host-side trace.bin extraction from the memory dump
-```
-
-Once a file system exists, the OS can save binary traces to paths such as:
-
-```text
-/trace/kernel.trace
-```
-
-## Format Conversion
-
-Preferred conversion path:
-
-```text
-ostrace binary
-  -> ftrace text
-  -> Chrome Trace JSON
-  -> Perfetto protobuf / pftrace
-```
-
-The kernel hot path should not generate ftrace text. Text and protobuf export
-should be done by OS-side drain code outside the hot path or by host-side
-converter tools using binary records plus metadata.
-
-## First MVP
-
-Implement first:
-
-- `#![no_std]`.
-- Caller-provided `&'static mut [u8]`.
-- Single ring buffer.
-- Fixed header plus variable payload.
-- 8-byte alignment.
-- Padding record.
-- Overwrite mode.
-- `instant`, `begin`, `end`, `counter`, and `metadata`.
-- `TracePlatform` trait.
-- `snapshot` and `drain`.
-- Focused tests for record layout and ring buffer behavior.
-
-Defer:
-
-- Per-CPU ring buffers.
-- Lock-free concurrent writers.
-- Allocator support.
-- File system sinks.
-- Perfetto protobuf output.
-- eBPF verifier, VM, or JIT.
-- Strong binding to any tracepoint framework.
-- Strongly consistent PID/TID indexes for the current trace window.
+Detailed comment requirements are documented in `CODING_GUIDELINES.md`.
 
 ## Summary
 
-`ostrace` should be the common trace record core for Rust OS kernels. The OS
-injects time, identity, synchronization, and memory. Kernel modules or
-tracepoint hooks append structured events. `ostrace` writes compact binary
-records into a ring buffer, then the OS or host-side tools drain and export them
-to ftrace, Chrome Trace, Perfetto, or other formats.
+`ostrace` currently provides a minimal but end-to-end trace path for Rust OS
+kernels: the OS supplies one RAM region, platform timestamp/CPU hooks, and task
+references; `ostrace` writes per-CPU binary records into a self-describing trace
+image; host-side code parses the image and converts supported records to
+SmartPerf-compatible bytrace text.
